@@ -936,30 +936,40 @@ assert rc_unc["complete"] is True and rc_unc["optimal_matching_count"] == 2
 assert [x["status"] for x in rc_unc["readings"]] == ["uncertain"] * 2
 assert all(x["matched_tube_id"] is None for x in rc_unc["readings"])
 assert "身份不确定" in rc_unc["reason"]
-# 与独立暴力枚举对照(全排列求最小总差 + 候选集合)
+# 与独立暴力枚举对照(全排列求最小总差 + 候选集合, 十进制精确比较)
 def _brute_recheck(plan, readings, tol):
+    from decimal import Decimal as _D
     tubes = sorted(
         ((p["tube_id"], p["slot"], p["mass"])
          for p in plan["result"]["placements"] if p["slot"] is not None),
         key=lambda x: x[0])
     rd = sorted(readings)
     n = len(tubes)
+    def _d(x):
+        return x if isinstance(x, _D) else _D(str(x))
+    tol_d = _d(tol)
+    edge = [[None] * n for _ in range(n)]
+    for k in range(n):
+        for jj in range(n):
+            dd = abs(_d(tubes[k][2]) - _d(rd[jj][1]))
+            if dd <= tol_d:
+                edge[k][jj] = dd
     best = None; cnt = 0; cand = [set() for _ in range(n)]
     for perm in _it.permutations(range(n)):
-        tot = 0.0; ok = True
+        tot = _D(0); ok = True
         for k in range(n):
-            d = abs(tubes[k][2] - rd[perm[k]][1])
-            if d > tol + 1e-9:
+            d = edge[k][perm[k]]
+            if d is None:
                 ok = False; break
             tot += d
         if not ok:
             continue
-        if best is None or tot < best - 1e-9 * max(1.0, best):
+        if best is None or tot < best:
             best, cnt = tot, 1
             cand = [set() for _ in range(n)]
             for k in range(n):
                 cand[perm[k]].add(tubes[k][0])
-        elif tot <= best + 1e-9 * max(1.0, best):
+        elif tot == best:
             cnt += 1
             for k in range(n):
                 cand[perm[k]].add(tubes[k][0])
@@ -968,7 +978,7 @@ plan2 = call("GET", f"/api/plan/{rcid}")
 _rd = [(0, 50.01), (3, 51.02), (6, 51.99), (9, 53.0)]
 rc_rb = rc_call(rcid, _rd, 0.05)
 b_best, b_cnt, b_cand = _brute_recheck(plan2, _rd, 0.05)
-assert abs(rc_rb["total_abs_deviation_g"] - b_best) < 1e-9
+assert abs(rc_rb["total_abs_deviation_g"] - float(b_best)) < 1e-12
 assert rc_rb["optimal_matching_count"] == b_cnt
 for row in rc_rb["readings"]:
     j = [r[0] for r in sorted(_rd)].index(row["slot"])

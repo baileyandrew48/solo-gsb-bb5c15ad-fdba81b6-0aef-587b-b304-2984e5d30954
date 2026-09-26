@@ -27,6 +27,20 @@ function fmt(x, d = 2) {
   if (Math.abs(x) >= 1000) return x.toFixed(0);
   return Number(x).toFixed(d);
 }
+// 标称质量按十进制精确比较, 不舍入到 0.01 g: 当数值不是 0.01 整倍数时
+// 显示完整精度(如 10.0000000004), 否则按两位小数显示。
+function fmtNom(x) {
+  if (x === null || x === undefined || Number.isNaN(x)) return "–";
+  const rounded = Math.round(Number(x) * 100) / 100;
+  return Math.abs(Number(x) - rounded) > 1e-12 ? String(x) : Number(x).toFixed(2);
+}
+// 偏差/总差默认 d 位小数; 含有更细尾数(近等代价情形)时显示完整精度。
+function fmtFine(x, d = 3) {
+  if (x === null || x === undefined || Number.isNaN(x)) return "–";
+  const p = 10 ** d;
+  const rounded = Math.round(Number(x) * p) / p;
+  return Math.abs(Number(x) - rounded) > 1e-12 ? String(x) : Number(x).toFixed(d);
+}
 function angleNorm(a) { return ((a % 360) + 360) % 360; }
 
 // ---------------------------------------------------------------------------
@@ -1628,7 +1642,7 @@ function renderRecheckResult(d) {
   let head = `<div class="wc-note">统一允许偏差 ±${fmt(d.tolerance_g, 3)} g ·
     方案 ${d.plan_tube_count} 支试管 / 实测 ${d.reading_count} 份。`;
   if (d.complete) {
-    head += ` 最小总绝对质量差 <b>${fmt(d.total_abs_deviation_g, 3)} g</b> ·
+    head += ` 最小总绝对质量差 <b>${fmtFine(d.total_abs_deviation_g)} g</b> ·
       最优匹配 ${d.optimal_matching_count} 种(逐槽候选为全部最优匹配的汇总, 非任取一解)。`;
   } else if (d.max_matched_pairs !== null && d.max_matched_pairs !== undefined) {
     head += ` 在偏差内最多可匹配 ${d.max_matched_pairs} 对。`;
@@ -1648,8 +1662,8 @@ function renderRecheckResult(d) {
     const rRows = d.readings.map((r) => {
       const [txt, cls] = rcTag[r.status];
       const cands = r.candidates.map((c) =>
-        `<span class="badge">试管 ${c.tube_id} · 标称 ${fmt(c.nominal_mass_g, 2)} g ·
-          方案槽 #${c.plan_slot} · 偏差 ${fmt(c.abs_deviation_g, 3)} g</span>`).join(" ");
+        `<span class="badge">试管 ${c.tube_id} · 标称 ${fmtNom(c.nominal_mass_g)} g ·
+          方案槽 #${c.plan_slot} · 偏差 ${fmtFine(c.abs_deviation_g)} g</span>`).join(" ");
       return `<tr>
         <td>#${r.slot} <span class="small">(${fmt(r.angle_deg, 1)}°)</span></td>
         <td><b>${fmt(r.measured_mass_g, 2)}</b></td>
@@ -1662,7 +1676,7 @@ function renderRecheckResult(d) {
       const [txt, cls] = rcTag[t.status];
       return `<tr>
         <td>${t.tube_id}</td>
-        <td>${fmt(t.nominal_mass_g, 2)}</td>
+        <td>${fmtNom(t.nominal_mass_g)}</td>
         <td>#${t.plan_slot}</td>
         <td>${t.candidate_slots.map((s) => `#${s}`).join("、")}</td>
         <td><span class="status-tag ${cls}">${txt}</span></td>

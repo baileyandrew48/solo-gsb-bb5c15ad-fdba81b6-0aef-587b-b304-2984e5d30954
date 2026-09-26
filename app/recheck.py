@@ -11,22 +11,32 @@
 复核问题即: 只在**质量差不超过偏差**的边上, 求方案试管与实测读数之间的
 **一对一匹配**(二分图完美匹配), 并以**总绝对质量差最小**为准。
 
+精确十进制比较
+--------------
+标称质量、实测质量与允许偏差一律按其**字符串表示的十进制值**构造 Decimal
+精确比较: 标称质量**不舍入到 0.01 g**, 10.0000000004 与 10.0000000007 是
+两个不同的值。因此不使用任何浮点相对容差——总绝对质量差相差 1e-10 g 的两个
+匹配不会被判为"等代价", 边判定与最优判定都是精确的十进制大小/相等关系。
+仅实测读数仍须为 0.01 g 的整数倍(天平读数精度), 这是对录入值本身的校验,
+不影响标称质量的精度。
+
 精确求解(子集动态规划)
 --------------------
 读数最多 12 份, 故完整匹配时方案管数 n <= 12, 用子集 DP **精确**求最小
-总绝对质量差(不做贪心、不取近似):
+总绝对质量差(不做贪心、不取近似、不枚举全部排列):
 
-    f(i, S) = min_{j in S} f(i-1, S\\{j}) + |m_i - r_j|   前 i 支试管匹配读数集 S
-    g(i, S) = min_{j in S} |m_i - r_j| + g(i+1, S\\{j})   第 i 支起匹配读数集 S
+    F[i][S]  前 i 支试管(按管号升序)匹配读数集 S 的最小总绝对质量差(Decimal)
+    C[i][S]  达到 F[i][S] 的匹配条数(任意精度整数, 与 F 在同一遍 DP 内递推)
+    G[i][S]  第 i 支起的试管匹配读数集 S 的最小总绝对质量差(Decimal)
 
-最小总绝对质量差 C* = f(n, 全集)。边 (k, j) 出现在**某个最优匹配**中,
-当且仅当存在不含 j 的读数集 S 使
+最小总绝对质量差 C* = F[n][全集]。边 (k, j) 出现在**某个最优匹配**中,
+当且仅当存在不含 j、且大小恰为 k 的读数集 S 使
 
-    f(k, S) + |m_k - r_j| + g(k+1, 全集 \\ S \\ {j}) = C*     (1e-9 相对容差)
+    F[k][S] + |m_k - r_j| + G[k+1][全集 \\ S \\ {j}] = C*   (十进制精确相等)
 
-其中 S 是前 k 支试管占用的读数集(不含 j)。据此对每个实测槽汇总**所有
-最优匹配**可能对应的试管, 而不枚举全部最优匹配(退化情形下可达 n! 条;
-条数用同一 DP 以任意精度整数计数):
+同一组 F/G 同时给出两个方向的候选: 每个实测读数 j 在全部最优匹配中可能
+对应的试管, 以及每支方案试管 k 在全部最优匹配中可能落入的实测槽, 不枚举
+全部最优匹配(退化情形下可达 n! 条; 条数由 C[n][全集] 直接得到):
 
 - **候选唯一**: 该槽读数在全部最优匹配中都对应同一支试管 —— 按原方案
   槽位判定"正确"(读数槽即该管方案槽)或"错槽"(读数槽不是该管方案槽);
@@ -34,8 +44,7 @@
 
 读数数量与方案管数不等、或不存在完整匹配时, 明确说明原因(并给出最多
 可匹配对数, 以及在允许偏差内无任何兼容读数的试管/无任何兼容试管的
-读数清单)。对称地, 也汇总每支方案试管在全部最优匹配中可能落入的实测
-槽位, 供操作者交叉核对。
+读数清单)。
 
 拒绝条件(ValueError → HTTP 400)
 -------------------------------
@@ -47,14 +56,13 @@
 from __future__ import annotations
 
 import math
+from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
 # 读数份数上限: 子集 DP 状态数为 2^n, n <= 12 时 4096, 瞬时完成
 MAX_READINGS = 12
-# 天平读数精度(g): 实测质量必须是该步长的整数倍
-MASS_STEP_G = 0.01
-# 与 app/compare.py / app/loading.py 一致的数值容差
-_NUM_TOL = 1e-9
+# 天平读数精度(g): 实测质量必须是该步长的整数倍(十进制精确判定)
+MASS_STEP = Decimal("0.01")
 
 _STATUS_LABELS = {
     "correct": "正确",
@@ -63,9 +71,46 @@ _STATUS_LABELS = {
 }
 
 
+def _as_decimal(value: Any, what: str) -> Decimal:
+    """把质量/偏差入参按**字符串表示的十进制值**精确转为 Decimal。
+
+    float 先经 repr 取最短可回显十进制串(如 10.0000000004 对应的字符串),
+    从而保留其全部可分辨十进制值, 不引入二进制浮点误差; 非有限 float、
+    NaN/Infinity 串或不支持的类型一律拒绝。bool 不按数值接受。
+    """
+    if isinstance(value, Decimal):
+        d = value
+    elif isinstance(value, bool):
+        raise ValueError(f"{what}必须是数值。")
+    elif isinstance(value, int):
+        d = Decimal(value)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{what}必须为有限数值。")
+        d = Decimal(repr(value))
+    elif isinstance(value, str):
+        try:
+            d = Decimal(value.strip())
+        except (InvalidOperation, AttributeError, ValueError):
+            raise ValueError(f"{what}必须是十进制数值。") from None
+        if not d.is_finite():
+            raise ValueError(f"{what}必须为有限数值。")
+    else:
+        raise ValueError(f"{what}必须是十进制数值。")
+    return d
+
+
+def _dec_str(d: Decimal) -> str:
+    """十进制值的紧凑展示串(去掉无意义尾零), 用于原因说明。"""
+    s = str(d)
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
 def recheck_tube_loading(plan: dict[str, Any],
                          readings: list[dict[str, Any]],
-                         tolerance_g: float) -> dict[str, Any]:
+                         tolerance_g: Any) -> dict[str, Any]:
     """对已保存方案做现场装管复核(只读)。
 
     参数
@@ -84,12 +129,13 @@ def recheck_tube_loading(plan: dict[str, Any],
     """
     plan_id = plan.get("id")
 
-    # ---- 统一允许偏差 ----
-    tol = float(tolerance_g)
-    if not math.isfinite(tol):
-        raise ValueError("统一允许偏差必须为有限数值。")
-    if tol < 0.0:
+    # ---- 统一允许偏差(十进制精确值) ----
+    tol = _as_decimal(tolerance_g, "统一允许偏差")
+    if tol < 0:
         raise ValueError("统一允许偏差不能为负。")
+    # 输出回显: 数值类型原样回显(其十进制字符串即精确值), 其他类型转 float
+    tol_out = (tolerance_g if isinstance(tolerance_g, (int, float))
+               and not isinstance(tolerance_g, bool) else float(tol))
 
     # ---- 方案试管(标称质量与方案槽位) ----
     result = plan.get("result") or {}
@@ -111,10 +157,15 @@ def recheck_tube_loading(plan: dict[str, Any],
         if slot in seen_slots:
             raise ValueError(f"摆放明细中槽位 {slot} 被重复占用。")
         seen_slots.add(slot)
-        mass = float(p["mass"])
-        if not math.isfinite(mass) or mass <= 0.0:
+        mass_dec = _as_decimal(p["mass"], f"试管 {tid} 的标称质量")
+        if mass_dec <= 0:
             raise ValueError(f"试管 {tid} 的标称质量必须为正数。")
-        tubes.append({"tube_id": tid, "plan_slot": slot, "mass": mass})
+        tubes.append({
+            "tube_id": tid,
+            "plan_slot": slot,
+            "mass": mass_dec,                       # 精确十进制值(不舍入)
+            "mass_raw": p["mass"],                  # 原始入参, 用于输出回显
+        })
     # 管号升序: DP 位序与结果展示都以此为依据
     tubes.sort(key=lambda t: t["tube_id"])
     n = len(tubes)
@@ -133,7 +184,7 @@ def recheck_tube_loading(plan: dict[str, Any],
             "enabled": bool(item.get("enabled", True)),
         }
 
-    # ---- 实测读数 ----
+    # ---- 实测读数(0.01 g 精度, 十进制精确判定) ----
     if not isinstance(readings, (list, tuple)) or not readings:
         raise ValueError("请至少录入 1 份实测读数。")
     if len(readings) > MAX_READINGS:
@@ -154,18 +205,20 @@ def recheck_tube_loading(plan: dict[str, Any],
             raise ValueError(
                 f"实测槽位 {slot} 在方案中为禁用槽, 不属于可装管的启用槽。"
             )
-        mass = float(raw["mass"])
-        if not math.isfinite(mass) or mass <= 0.0:
+        raw_mass = raw["mass"]
+        mass = _as_decimal(raw_mass, f"槽位 {slot} 的实测质量")
+        if mass <= 0:
             raise ValueError(f"槽位 {slot} 的实测质量必须为正的有限数。")
-        scaled = mass / MASS_STEP_G
-        if abs(scaled - round(scaled)) > 1e-6:
+        if mass % MASS_STEP != 0:
+            shown = repr(raw_mass) if isinstance(raw_mass, float) else str(raw_mass)
             raise ValueError(
-                f"槽位 {slot} 的实测质量 {mass:g} g 不符合 0.01 g 读数精度"
+                f"槽位 {slot} 的实测质量 {shown} g 不符合 0.01 g 读数精度"
                 "(实测质量须为 0.01 g 的整数倍)。"
             )
         meas.append({
             "slot": slot,
-            "mass": round(scaled) * MASS_STEP_G,
+            "mass": mass,                 # 精确十进制值
+            "mass_raw": raw_mass,         # 原始入参(0.01 精度, 输出回显)
             "angle": info["angle"],
         })
     # 槽号升序: 读数位序与展示顺序一致
@@ -176,16 +229,19 @@ def recheck_tube_loading(plan: dict[str, Any],
         return {
             "method": (
                 "二分图一对一匹配(子集动态规划精确求最小总绝对质量差, "
-                f"读数≤{MAX_READINGS} 份): 只在 |标称-实测| ≤ 统一允许偏差的"
-                "边上匹配; 对每个实测槽汇总所有最优匹配可能对应的试管, "
-                "唯一时按原方案槽位判定正确/错槽, 多解时标为身份不确定"
+                f"读数≤{MAX_READINGS} 份): 标称质量、实测质量与偏差按其字符串"
+                "表示的十进制值精确比较(标称质量不舍入到 0.01 g, 无浮点容差), "
+                "只在 |标称-实测| ≤ 统一允许偏差的边上匹配; 最小代价、最优计数"
+                "与双向候选由同一子集 DP 精确给出; 对每个实测槽汇总所有最优"
+                "匹配可能对应的试管, 唯一时按原方案槽位判定正确/错槽, 多解时"
+                "标为身份不确定"
             ),
             "plan": {
                 "id": plan.get("id"),
                 "name": plan.get("name"),
                 "created_at": plan.get("created_at"),
             },
-            "tolerance_g": tol,
+            "tolerance_g": tol_out,
             "plan_tube_count": n,
             "reading_count": m,
             "complete": False,
@@ -211,108 +267,129 @@ def recheck_tube_loading(plan: dict[str, Any],
         )
         return out
 
-    # ---- 匹配边: 仅质量差不超过统一允许偏差的试管-读数对 ----
-    INF = math.inf
-    edge_tol = _NUM_TOL * max(1.0, tol)
-    cost = [[INF] * n for _ in range(n)]
+    # ---- 匹配边: 仅十进制精确质量差不超过统一允许偏差的试管-读数对 ----
+    cost: list[list[Optional[Decimal]]] = [[None] * n for _ in range(n)]
     for k, t in enumerate(tubes):
         for j, r in enumerate(meas):
             d = abs(t["mass"] - r["mass"])
-            if d <= tol + edge_tol:
+            if d <= tol:
                 cost[k][j] = d
 
     size = 1 << n
     full = size - 1
 
-    # f[i][mask]: 前 i 支试管(按管号升序)匹配读数集 mask 的最小总绝对质量差
-    f = [[INF] * size for _ in range(n + 1)]
-    f[0][0] = 0.0
+    # 子集大小(位 1 的个数): 候选边判定只在大小恰为 k 的子集上进行
+    masks_by_pop: list[list[int]] = [[0]]
+    for _ in range(n):
+        masks_by_pop.append([])
+    for mask in range(1, size):
+        masks_by_pop[mask.bit_count()].append(mask)
+
+    # F[i][mask]: 前 i 支试管(管号升序)匹配读数集 mask 的最小总绝对质量差;
+    # C[i][mask]: 达到 F[i][mask] 的匹配条数(任意精度整数)。
+    # 最小代价与最优计数在同一遍子集 DP 内统一递推, 不分两遍、不枚举排列。
+    F: list[list[Optional[Decimal]]] = [[None] * size for _ in range(n + 1)]
+    C = [[0] * size for _ in range(n + 1)]
+    F[0][0] = Decimal(0)
+    C[0][0] = 1
     for i in range(1, n + 1):
-        fi, fp, ci = f[i], f[i - 1], cost[i - 1]
+        fi, fp, ci = F[i], F[i - 1], cost[i - 1]
+        cnti, cntp = C[i], C[i - 1]
         for mask in range(size):
-            best = INF
+            best: Optional[Decimal] = None
+            ways = 0
             sub = mask
             while sub:
                 lsb = sub & (-sub)
+                j = lsb.bit_length() - 1
                 prev = fp[mask ^ lsb]
-                c = ci[lsb.bit_length() - 1]
-                if prev < INF and c < INF:
+                c = ci[j]
+                if prev is not None and c is not None:
                     v = prev + c
-                    if v < best:
+                    if best is None or v < best:
                         best = v
+                        ways = cntp[mask ^ lsb]
+                    elif v == best:  # 十进制精确相等, 无浮点容差
+                        ways += cntp[mask ^ lsb]
                 sub ^= lsb
             fi[mask] = best
+            cnti[mask] = ways
 
-    # g[i][mask]: 第 i 支起的试管匹配读数集 mask 的最小总绝对质量差
-    g = [[INF] * size for _ in range(n + 1)]
-    g[n][0] = 0.0
+    # G[i][mask]: 第 i 支起的试管匹配读数集 mask 的最小总绝对质量差
+    G: list[list[Optional[Decimal]]] = [[None] * size for _ in range(n + 1)]
+    G[n][0] = Decimal(0)
     for i in range(n - 1, -1, -1):
-        gi, gn, ci = g[i], g[i + 1], cost[i]
+        gi, gn, ci = G[i], G[i + 1], cost[i]
         for mask in range(size):
-            best = INF
+            best = None
             sub = mask
             while sub:
                 lsb = sub & (-sub)
+                j = lsb.bit_length() - 1
                 nxt = gn[mask ^ lsb]
-                c = ci[lsb.bit_length() - 1]
-                if nxt < INF and c < INF:
+                c = ci[j]
+                if nxt is not None and c is not None:
                     v = nxt + c
-                    if v < best:
+                    if best is None or v < best:
                         best = v
                 sub ^= lsb
             gi[mask] = best
 
-    # h[i][mask]: 前 i 支试管与读数集 mask 的子集最多可匹配对数(用于不可行说明)
-    h = [[0] * size for _ in range(n + 1)]
-    for i in range(1, n + 1):
-        hi, hp, ci = h[i], h[i - 1], cost[i - 1]
-        for mask in range(size):
-            best = hp[mask]  # 试管 i-1 不参与匹配
-            sub = mask
-            while sub:
-                lsb = sub & (-sub)
-                if ci[lsb.bit_length() - 1] < INF:
-                    v = hp[mask ^ lsb] + 1
-                    if v > best:
-                        best = v
-                sub ^= lsb
-            hi[mask] = best
-    max_pairs = h[n][full]
-
     # ---- 不存在完整匹配: 说明原因 ----
-    total = f[n][full]
-    if total == INF:
+    total = F[n][full]
+    if total is None:
+        # 最大可匹配对数仅在不可行时需要(可行时恒为 n), 惰性计算:
+        # H[i][mask] = 前 i 支试管与读数集 mask 的子集最多可匹配对数
+        H = [[0] * size for _ in range(n + 1)]
+        for i in range(1, n + 1):
+            hi, hp, ci = H[i], H[i - 1], cost[i - 1]
+            for mask in range(size):
+                best = hp[mask]  # 试管 i-1 不参与匹配
+                sub = mask
+                while sub:
+                    lsb = sub & (-sub)
+                    j = lsb.bit_length() - 1
+                    if ci[j] is not None:
+                        v = hp[mask ^ lsb] + 1
+                        if v > best:
+                            best = v
+                    sub ^= lsb
+                hi[mask] = best
+        max_pairs = H[n][full]
+
         out = _context()
         out["max_matched_pairs"] = max_pairs
         no_cand_tubes = [
             t for k, t in enumerate(tubes)
-            if all(cost[k][j] == INF for j in range(n))
+            if all(cost[k][j] is None for j in range(n))
         ]
         no_cand_readings = [
             r for j, r in enumerate(meas)
-            if all(cost[k][j] == INF for k in range(n))
+            if all(cost[k][j] is None for k in range(n))
         ]
         out["tubes_without_candidate"] = [
-            {"tube_id": t["tube_id"], "nominal_mass_g": t["mass"],
+            {"tube_id": t["tube_id"], "nominal_mass_g": t["mass_raw"],
              "plan_slot": t["plan_slot"]}
             for t in no_cand_tubes
         ]
         out["readings_without_candidate"] = [
-            {"slot": r["slot"], "measured_mass_g": r["mass"]}
+            {"slot": r["slot"], "measured_mass_g": r["mass_raw"]}
             for r in no_cand_readings
         ]
         parts = [
-            f"在统一允许偏差 ±{tol:g} g 内不存在完整的一对一匹配: "
+            f"在统一允许偏差 ±{_dec_str(tol)} g 内不存在完整的一对一匹配: "
             f"最多只能匹配 {max_pairs}/{n} 对。"
         ]
         if no_cand_tubes:
             txt = "、".join(
-                f"试管 {t['tube_id']}(标称 {t['mass']:g} g)" for t in no_cand_tubes
+                f"试管 {t['tube_id']}(标称 {str(t['mass'])} g)"
+                for t in no_cand_tubes
             )
             parts.append(f"{txt} 在偏差内没有任何可对应的实测读数。")
         if no_cand_readings:
             txt = "、".join(
-                f"槽 #{r['slot']}({r['mass']:g} g)" for r in no_cand_readings
+                f"槽 #{r['slot']}({_dec_str(r['mass'])} g)"
+                for r in no_cand_readings
             )
             parts.append(f"实测读数 {txt} 在偏差内没有任何可对应的方案试管。")
         parts.append(
@@ -322,54 +399,34 @@ def recheck_tube_loading(plan: dict[str, Any],
         out["reason"] = "".join(parts)
         return out
 
-    # ---- 最优匹配条数(任意精度整数, 不逐一枚举) ----
-    cnt = [[0] * size for _ in range(n + 1)]
-    cnt[0][0] = 1
-    for i in range(1, n + 1):
-        fi, fp, ci = f[i], f[i - 1], cost[i - 1]
-        cnti, cntp = cnt[i], cnt[i - 1]
-        for mask in range(size):
-            target = fi[mask]
-            if target == INF:
-                continue
-            tol_i = _NUM_TOL * max(1.0, target)
-            total_i = 0
-            sub = mask
-            while sub:
-                lsb = sub & (-sub)
-                prev_mask = mask ^ lsb
-                c = ci[lsb.bit_length() - 1]
-                prev = fp[prev_mask]
-                if prev < INF and c < INF and cntp[prev_mask]:
-                    if abs(prev + c - target) <= tol_i:
-                        total_i += cntp[prev_mask]
-                sub ^= lsb
-            cnti[mask] = total_i
-    optimal_count = cnt[n][full]
+    # ---- 最优匹配条数直接取自统一 DP(任意精度整数) ----
+    optimal_count = C[n][full]
 
-    # ---- 逐边判定: (k, j) 是否出现在某个最优匹配中 ----
-    tol_c = _NUM_TOL * max(1.0, total)
+    # ---- 逐边判定(双向候选): (k,j) 是否出现在某个最优匹配中 ----
+    # 同一组 F/G 同时汇总: 读数 j 的候选试管 cand_of_reading, 与试管 k 的
+    # 候选实测槽 cand_of_tube。等式按十进制精确比较, 无任何容差。
     cand_of_reading: list[list[int]] = [[] for _ in range(n)]  # j -> [k]
     cand_of_tube: list[list[int]] = [[] for _ in range(n)]     # k -> [j]
     for k in range(n):
-        fk, gk1, ck = f[k], g[k + 1], cost[k]
+        fk, gk1, ck = F[k], G[k + 1], cost[k]
         for j in range(n):
             c = ck[j]
-            if c == INF:
+            if c is None:
                 continue
             bit = 1 << j
             hit = False
-            # 前 k 支试管占用读数集 S(不含 j), 试管 k 取 j, 其余试管取剩余
-            for mask in range(size):
+            # 前 k 支试管占用大小恰为 k、不含 j 的读数集 S; 试管 k 取 j,
+            # 其后的试管取 全集\S\{j}(按 popcount 预分组, 直接枚举)
+            for mask in masks_by_pop[k]:
                 if mask & bit:
                     continue
                 a = fk[mask]
-                if a == INF:
+                if a is None:
                     continue
                 b = gk1[full ^ mask ^ bit]
-                if b == INF:
+                if b is None:
                     continue
-                if abs(a + c + b - total) <= tol_c:
+                if a + c + b == total:
                     hit = True
                     break
             if hit:
@@ -381,9 +438,9 @@ def recheck_tube_loading(plan: dict[str, Any],
     for j, r in enumerate(meas):
         cands = [{
             "tube_id": tubes[k]["tube_id"],
-            "nominal_mass_g": tubes[k]["mass"],
+            "nominal_mass_g": tubes[k]["mass_raw"],
             "plan_slot": tubes[k]["plan_slot"],
-            "abs_deviation_g": cost[k][j],
+            "abs_deviation_g": float(cost[k][j]),
         } for k in cand_of_reading[j]]
         if len(cands) == 1:
             k = cand_of_reading[j][0]
@@ -393,13 +450,13 @@ def recheck_tube_loading(plan: dict[str, Any],
                 status = "correct"
                 detail = (
                     f"全部最优匹配中该槽读数唯一对应试管 {t['tube_id']}"
-                    f"(标称 {t['mass']:g} g), 与其方案槽位一致。"
+                    f"(标称 {str(t['mass'])} g), 与其方案槽位一致。"
                 )
             else:
                 status = "wrong_slot"
                 detail = (
                     f"全部最优匹配中该槽读数唯一对应试管 {t['tube_id']}"
-                    f"(标称 {t['mass']:g} g), 但试管 {t['tube_id']} 的方案槽位"
+                    f"(标称 {str(t['mass'])} g), 但试管 {t['tube_id']} 的方案槽位"
                     f"为 #{t['plan_slot']}: 该管未按方案装管(错槽)。"
                 )
         else:
@@ -413,7 +470,7 @@ def recheck_tube_loading(plan: dict[str, Any],
         reading_rows.append({
             "slot": r["slot"],
             "angle_deg": r["angle"],
-            "measured_mass_g": r["mass"],
+            "measured_mass_g": r["mass_raw"],
             "candidates": cands,
             "candidate_count": len(cands),
             "status": status,
@@ -445,7 +502,7 @@ def recheck_tube_loading(plan: dict[str, Any],
             )
         tube_rows.append({
             "tube_id": t["tube_id"],
-            "nominal_mass_g": t["mass"],
+            "nominal_mass_g": t["mass_raw"],
             "plan_slot": t["plan_slot"],
             "candidate_slots": slots_j,
             "status": status,
@@ -460,7 +517,7 @@ def recheck_tube_loading(plan: dict[str, Any],
     out = _context()
     out.update({
         "complete": True,
-        "total_abs_deviation_g": total,
+        "total_abs_deviation_g": float(total),
         "optimal_matching_count": optimal_count,
         "max_matched_pairs": n,
         "readings": reading_rows,
@@ -475,10 +532,11 @@ def recheck_tube_loading(plan: dict[str, Any],
         "最优匹配唯一" if optimal_count == 1
         else f"最优匹配共 {optimal_count} 种"
     )
+    total_txt = _dec_str(total)
     if n_wrong == 0 and n_uncertain == 0:
         out["reason"] = (
             f"{n} 个实测槽全部唯一对应且与方案槽位一致: 装管全部正确"
-            f"(最小总绝对质量差 {total:g} g, {match_txt})。"
+            f"(最小总绝对质量差 {total_txt} g, {match_txt})。"
         )
     elif n_wrong > 0:
         slots = "、#".join(
@@ -490,7 +548,7 @@ def recheck_tube_loading(plan: dict[str, Any],
         )
         out["reason"] = (
             f"发现 {n_wrong} 处错槽: 实测槽 #{slots} 唯一对应的试管与其方案"
-            f"槽位不符{unc_txt}(最小总绝对质量差 {total:g} g, {match_txt})。"
+            f"槽位不符{unc_txt}(最小总绝对质量差 {total_txt} g, {match_txt})。"
         )
     else:
         slots = "、#".join(
@@ -499,6 +557,6 @@ def recheck_tube_loading(plan: dict[str, Any],
         out["reason"] = (
             f"{n_uncertain} 个实测槽(#{slots})身份不确定: 最优匹配不唯一, "
             "这些槽的读数在偏差内可对应多支试管, 不能任取一解断言错放"
-            f"(最小总绝对质量差 {total:g} g, {match_txt})。"
+            f"(最小总绝对质量差 {total_txt} g, {match_txt})。"
         )
     return out

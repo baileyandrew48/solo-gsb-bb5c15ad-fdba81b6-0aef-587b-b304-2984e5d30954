@@ -4,12 +4,15 @@
 在**所有最优匹配**中可能对应的试管集合, 必须与全排列暴力枚举一致; 候选
 唯一时按原方案槽位判定正确/错槽, 多解时标为身份不确定; 读数数量与方案
 管数不等、不存在完整匹配时明确说明原因; 读数精度(0.01 g)、份数上限、
-槽位合法性、偏差非负等非法输入必须拒绝; 复核过程不修改入参(只读)。
+槽位合法性、偏差非负等非法输入必须拒绝; 质量与偏差按字符串表示的十进制
+值精确比较(标称质量不舍入到 0.01 g, 无浮点容差), 近等代价但不等的匹配
+不得合并; 复核过程不修改入参(只读)。
 """
 import copy
 import itertools
 import random
 import unittest
+from decimal import Decimal
 
 from app.recheck import recheck_tube_loading
 
@@ -49,18 +52,24 @@ def _plan(pid, placements, slots_n=12, enabled=None, name=None):
 
 
 def _brute(tubes, readings, tol):
-    """全排列参考实现。
+    """全排列参考实现(十进制精确版)。
 
     tubes: [(tube_id, plan_slot, mass)]; readings: [(slot, mass)]。
-    返回 (最小总绝对质量差或 None, 最优匹配条数, {读数序号: {试管序号}},
-    {试管序号: {读数序号}}); 不存在完整匹配时首项为 None。
+    质量与偏差按字符串表示的十进制值精确比较(与生产实现一致, 无浮点
+    容差)。返回 (最小总绝对质量差或 None, 最优匹配条数, {读数序号:
+    {试管序号}}, {试管序号: {读数序号}}); 不存在完整匹配时首项为 None。
     """
     n = len(tubes)
+
+    def _d(x):
+        return x if isinstance(x, Decimal) else Decimal(str(x))
+
+    tol_d = _d(tol)
     cost = [[None] * n for _ in range(n)]
     for k, (_, _, mk) in enumerate(tubes):
         for j, (_, rj) in enumerate(readings):
-            d = abs(mk - rj)
-            if d <= tol + 1e-9 * max(1.0, tol):
+            d = abs(_d(mk) - _d(rj))
+            if d <= tol_d:
                 cost[k][j] = d
     best = None
     count = 0
@@ -68,7 +77,7 @@ def _brute(tubes, readings, tol):
     cand_t = [set() for _ in range(n)]
     for perm in itertools.permutations(range(n)):
         # perm[k] = 试管 k 匹配的读数序号
-        tot = 0.0
+        tot = Decimal(0)
         ok = True
         for k in range(n):
             c = cost[k][perm[k]]
@@ -78,14 +87,14 @@ def _brute(tubes, readings, tol):
             tot += c
         if not ok:
             continue
-        if best is None or tot < best - 1e-9 * max(1.0, best):
+        if best is None or tot < best:
             best, count = tot, 1
             cand_r = [set() for _ in range(n)]
             cand_t = [set() for _ in range(n)]
             for k in range(n):
                 cand_r[perm[k]].add(k)
                 cand_t[k].add(perm[k])
-        elif tot <= best + 1e-9 * max(1.0, best):
+        elif tot == best:
             count += 1
             for k in range(n):
                 cand_r[perm[k]].add(k)
@@ -226,6 +235,82 @@ class TestRecheck(unittest.TestCase):
         self.assertEqual([x["status"] for x in r["readings"]],
                          ["wrong_slot"] * 2)
 
+    def test_near_equal_decimal_masses_not_merged(self):
+        # 回归: 标称质量仅差 1e-10 g 量级时, 旧实现按 1e-9 相对容差把 24 个
+        # 排列全部误并为"最优"; 精确十进制比较下只有真正等代价的 6 个最优。
+        # 四管按编号在槽 0~3, 标称 10.0000000004/10.0000000007/
+        # 9.9999999998/10.0000000004 g; 实测 10/10.01/10.02/10.03 g; 偏差 0.1 g。
+        p = _plan(1, {
+            0: (1, 10.0000000004),
+            1: (2, 10.0000000007),
+            2: (3, 9.9999999998),
+            3: (4, 10.0000000004),
+        }, slots_n=4)
+        r = recheck_tube_loading(p, [
+            {"slot": 0, "mass": 10.0}, {"slot": 1, "mass": 10.01},
+            {"slot": 2, "mass": 10.02}, {"slot": 3, "mass": 10.03},
+        ], 0.1)
+        self.assertTrue(r["complete"])
+        self.assertEqual(r["optimal_matching_count"], 6)
+        self.assertEqual(
+            Decimal(str(r["total_abs_deviation_g"])),
+            Decimal("0.0599999987"),
+        )
+        st = {x["slot"]: x for x in r["readings"]}
+        # 槽 0 仅对应管 3(旧实现曾在此排除管 3): 唯一但与方案槽 2 不符 -> 错槽
+        self.assertEqual(
+            [c["tube_id"] for c in st[0]["candidates"]], [3])
+        self.assertEqual(st[0]["status"], "wrong_slot")
+        self.assertEqual(st[0]["matched_tube_id"], 3)
+        # 其余槽候选恰为管 1、2、4 -> 身份不确定
+        for s in (1, 2, 3):
+            self.assertEqual(
+                sorted(c["tube_id"] for c in st[s]["candidates"]), [1, 2, 4])
+            self.assertEqual(st[s]["status"], "uncertain")
+            self.assertIsNone(st[s]["matched_tube_id"])
+        self.assertEqual(r["summary"],
+                         {"correct": 0, "wrong_slot": 1, "uncertain": 3})
+        # 对称的逐管视图: 管 3 唯一落槽 0(错槽); 管 1 只可能落 1/2/3,
+        # 不含其方案槽 0(错槽); 管 2/4 候选含各自方案槽 -> 不确定
+        tt = {x["tube_id"]: x for x in r["tubes"]}
+        self.assertEqual(tt[3]["candidate_slots"], [0])
+        self.assertEqual(tt[3]["status"], "wrong_slot")
+        self.assertEqual(tt[1]["candidate_slots"], [1, 2, 3])
+        self.assertEqual(tt[1]["status"], "wrong_slot")
+        self.assertEqual(tt[2]["status"], "uncertain")
+        self.assertEqual(tt[4]["status"], "uncertain")
+        # 标称质量按字符串十进制值精确回显, 未舍入到 0.01 g
+        self.assertEqual(
+            st[0]["candidates"][0]["nominal_mass_g"], 9.9999999998)
+
+    def test_decimal_string_and_boundary_exact(self):
+        # 字符串形式的标称质量与偏差同样按十进制值精确处理; 标称质量保留
+        # 1e-10 g 量级差异, 不被舍入到 0.01 g; 偏差边界含等号且不放大。
+        p = _plan(1, {
+            0: (1, "10.0000000004"),
+            1: (2, "10.0000000007"),
+        }, slots_n=2)
+        two_readings = [{"slot": 0, "mass": 10.0}, {"slot": 1, "mass": 10.0}]
+        # 偏差 4e-10: 管 2(差 7e-10)无任何兼容读数 -> 不存在完整匹配
+        r = recheck_tube_loading(p, two_readings, "0.0000000004")
+        self.assertFalse(r["complete"])
+        self.assertEqual(r["max_matched_pairs"], 1)
+        self.assertEqual(
+            [t["tube_id"] for t in r["tubes_without_candidate"]], [2])
+        # 偏差恰为 7e-10(含等号): 四条边全通, 两种匹配等代价(读数相同)
+        r2 = recheck_tube_loading(p, two_readings, "0.0000000007")
+        self.assertTrue(r2["complete"])
+        self.assertEqual(r2["optimal_matching_count"], 2)
+        self.assertEqual(
+            Decimal(str(r2["total_abs_deviation_g"])),
+            Decimal("0.0000000011"))
+        # 偏差小 1e-13: 管 2 的两条边恰好全部断开
+        r3 = recheck_tube_loading(p, two_readings, "0.0000000006999")
+        self.assertFalse(r3["complete"])
+        # 标称质量按字符串十进制值原样回显
+        self.assertEqual(r2["tubes"][1]["nominal_mass_g"],
+                         "10.0000000007")
+
     def test_matches_brute_force_random(self):
         rng = random.Random(20260924)
         for _ in range(60):
@@ -255,7 +340,8 @@ class TestRecheck(unittest.TestCase):
                 self.assertFalse(r["complete"])
                 continue
             self.assertTrue(r["complete"])
-            self.assertAlmostEqual(r["total_abs_deviation_g"], best, places=6)
+            # 十进制精确值相等: 不用近似比较
+            self.assertEqual(Decimal(str(r["total_abs_deviation_g"])), best)
             self.assertEqual(r["optimal_matching_count"], count)
             # 逐实测槽候选集合与暴力枚举一致
             for j, row in enumerate(sorted(r["readings"],
@@ -280,6 +366,50 @@ class TestRecheck(unittest.TestCase):
             self.assertEqual(
                 r["summary"]["correct"] + r["summary"]["wrong_slot"]
                 + r["summary"]["uncertain"], n)
+
+    def test_matches_brute_force_high_precision_nominals(self):
+        # 标称质量带 1e-10 g 量级的微小十进制差异(不与 0.01 g 对齐):
+        # DP 必须按精确十进制值区分近等代价, 与全排列暴力(Decimal)一致。
+        rng = random.Random(20260926)
+        for _ in range(40):
+            n = rng.randint(2, 7)
+            slots = rng.sample(range(12), n)
+            base = [round(rng.uniform(20.0, 60.0), 2) for _ in range(n)]
+            # 在 0.01 整倍数基础上叠加 ±1e-10 级扰动(字符串保留全部位)
+            jitter = rng.choice([-9, -7, -4, -1, 2, 3, 6, 8]) * 1e-10
+            hp = [f"{b + jitter:.10f}" for b in base]
+            placements = {s: (i + 1, hp[i]) for i, s in enumerate(slots)}
+            plan = _plan(1, placements)
+            perm_slots = slots[:]
+            rng.shuffle(perm_slots)
+            tol = rng.choice([0.02, 0.05, 0.1, 0.3])
+            readings = []
+            for i, s in enumerate(perm_slots):
+                noise = round(rng.uniform(-tol, tol), 2)
+                m = round(base[i] + noise, 2)
+                readings.append({"slot": s, "mass": max(0.01, m)})
+            r = recheck_tube_loading(plan, readings, tol)
+            tubes = sorted(
+                ((p["tube_id"], p["slot"], p["mass"])
+                 for p in plan["result"]["placements"]),
+                key=lambda x: x[0],
+            )
+            rd = sorted((x["slot"], x["mass"]) for x in readings)
+            best, count, cand_r, cand_t = _brute(tubes, rd, tol)
+            if best is None:
+                self.assertFalse(r["complete"])
+                continue
+            self.assertTrue(r["complete"])
+            self.assertEqual(Decimal(str(r["total_abs_deviation_g"])), best)
+            self.assertEqual(r["optimal_matching_count"], count)
+            for j, row in enumerate(sorted(r["readings"],
+                                           key=lambda x: x["slot"])):
+                want = {tubes[k][0] for k in cand_r[j]}
+                got = {c["tube_id"] for c in row["candidates"]}
+                self.assertEqual(got, want)
+            for k, trow in enumerate(r["tubes"]):
+                want_slots = sorted(rd[j][0] for j in cand_t[k])
+                self.assertEqual(trow["candidate_slots"], want_slots)
 
     def test_max_readings_accepted(self):
         # 12 管 / 12 读数上限内可复核
